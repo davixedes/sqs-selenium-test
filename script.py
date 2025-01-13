@@ -18,9 +18,9 @@ from ddtrace.profiling import Profiler
 # Inicialização do Datadog
 # ---------------
 # Ativar auto-patching de bibliotecas compatíveis
-patch(boto3=True, threading=True)
+patch(threading=True)  # Remove o argumento boto3=True (boto3 já é instrumentado automaticamente)
 
-# Configurar o tracer
+# Configurar o tracer para enviar spans ao Datadog Agent
 tracer.configure(
     hostname=os.getenv('DD_AGENT_HOST', 'localhost'),  # Agente no localhost
     port=int(os.getenv('DD_TRACE_AGENT_PORT', 8126)),  # Porta padrão do APM
@@ -101,7 +101,7 @@ def process_message(message, thread_id):
     - Remove a mensagem da fila em caso de sucesso
     """
     body = message.get('Body', '')
-    receipt_handle = message['ReceiptHandle']  # p/ deletar a mensagem após sucesso
+    receipt_handle = message['ReceiptHandle']  # Para deletar a mensagem após sucesso
 
     # Gera um span para a operação de processamento da mensagem
     with tracer.trace("sqs.message_processing", resource="selenium_action") as span:
