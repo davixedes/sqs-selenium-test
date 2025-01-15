@@ -5,20 +5,13 @@ import psutil
 import boto3
 import logging
 from datetime import datetime
-from threading import Thread
-
+from ddtrace import tracer
+from ddtrace.profiling import Profiler
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 
-from ddtrace import tracer, patch
-from ddtrace.profiling import Profiler
-
-# ---------------
-# Configuração do Datadog (Logs e APM)
-# ---------------
-patch(logging=True, boto3=True, threading=True)
-
+# --------------- Configuração do Datadog (Logs e APM) ---------------
 # Configurar tracer
 tracer.configure(
     hostname=os.getenv('DD_AGENT_HOST', 'localhost'),
@@ -44,10 +37,7 @@ logging.LoggerAdapter(log, extra={
     'dd.version': os.getenv('DD_VERSION', '1.0.0'),
 })
 
-
-# ---------------
-# Variáveis de Ambiente
-# ---------------
+# --------------- Variáveis de Ambiente ---------------
 CHROMEDRIVER_PATH = os.getenv('CHROMEDRIVER_PATH', '/usr/local/bin/chromedriver')
 CHROME_BINARY_PATH = os.getenv('CHROME_BINARY_PATH', '/usr/bin/google-chrome')
 WEBSITE_URL = os.getenv(
@@ -58,15 +48,15 @@ SQS_QUEUE_URL = os.getenv('SQS_QUEUE_URL')
 DLQ_URL = os.getenv('DLQ_URL')  # Dead Letter Queue para mensagens com falha
 AWS_REGION = os.getenv('AWS_REGION', 'sa-east-1')
 
-MAX_NUMBER_OF_MESSAGES = int(os.getenv('MAX_NUMBER_OF_MESSAGES', 5))
+# Configurações do SQS
+MAX_NUMBER_OF_MESSAGES = int(os.getenv('MAX_NUMBER_OF_MESSAGES', 1))  # Processar uma mensagem por vez
 POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', 5))
+VISIBILITY_TIMEOUT = int(os.getenv('VISIBILITY_TIMEOUT', 30))  # Tempo de visibilidade da mensagem
 
 sqs_client = boto3.client('sqs', region_name=AWS_REGION)
 
+# --------------- Funções Auxiliares ---------------
 
-# ---------------
-# Funções Auxiliares
-# ---------------
 @tracer.wrap("setup_driver")
 def setup_driver():
     """
@@ -107,7 +97,7 @@ def get_resource_usage():
 
 
 @tracer.wrap("process_message")
-def process_message(message, thread_id):
+def process_message(message):
     """
     Processa uma mensagem específica da fila SQS:
     """
@@ -115,7 +105,7 @@ def process_message(message, thread_id):
     receipt_handle = message['ReceiptHandle']
 
     if not body or len(body.strip()) == 0:
-        log.warning(f"[Thread {thread_id}] Mensagem vazia ou inválida. Ignorando.")
+        log.warning("Mensagem vazia ou inválida. Ignorando.")
         return
 
     driver = setup_driver()
@@ -124,21 +114,22 @@ def process_message(message, thread_id):
     try:
         with tracer.trace("selenium.load_page", resource=WEBSITE_URL):
             driver.get(WEBSITE_URL)
-            log.info(f"[Thread {thread_id}] Navegando no site {WEBSITE_URL}")
+            log.info(f"Navegando no site {WEBSITE_URL}")
 
         with tracer.trace("selenium.simulate_navigation"):
-            time.sleep(20)
+            time.sleep(20)  # Simular navegação
 
         memory_usage, cpu_usage = get_resource_usage()
         log.info(
-            f"[Thread {thread_id}] Mensagem processada com sucesso.",
+            "Mensagem processada com sucesso.",
             extra={"cpu_usage": cpu_usage, "memory_usage": memory_usage, "request_id": request_id}
         )
 
+        # Remover mensagem da fila após processamento bem-sucedido
         sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
 
     except Exception as e:
-        log.error(f"[Thread {thread_id}] Falha ao processar mensagem: {e}", exc_info=True)
+        log.error(f"Falha ao processar mensagem: {e}", exc_info=True)
 
         if DLQ_URL:
             sqs_client.send_message(QueueUrl=DLQ_URL, MessageBody=body)
@@ -150,15 +141,15 @@ def process_message(message, thread_id):
 @tracer.wrap("poll_sqs")
 def poll_sqs():
     """
-    Loop infinito que consulta a fila SQS e dispara threads para cada mensagem recebida.
+    Loop infinito que consulta a fila SQS e processa mensagens.
     """
     while True:
         try:
             response = sqs_client.receive_message(
                 QueueUrl=SQS_QUEUE_URL,
                 MaxNumberOfMessages=MAX_NUMBER_OF_MESSAGES,
-                WaitTimeSeconds=2,
-                VisibilityTimeout=30
+                WaitTimeSeconds=10,
+                VisibilityTimeout=VISIBILITY_TIMEOUT
             )
             messages = response.get("Messages", [])
 
@@ -167,13 +158,14 @@ def poll_sqs():
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            for i, msg in enumerate(messages):
-                process_message(msg,i)
+            for message in messages:
+                process_message(message)
 
         except Exception as e:
             log.error("Erro no loop principal de polling SQS.", exc_info=True)
 
 
+# --------------- Função Principal ---------------
 def main():
     log.info("Iniciando script de polling do SQS com Datadog APM...")
     poll_sqs()
@@ -181,4 +173,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
