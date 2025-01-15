@@ -42,30 +42,20 @@ RUN CHROME_VERSION=$(google-chrome --version | awk '{print $3}') && \
 # Limpeza para reduzir o tamanho da imagem
 RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Instalar o Datadog Trace Profiler para Python
-RUN pip install --no-cache-dir ddtrace[profiler]
-
-# Configurar Datadog (como variáveis de ambiente)
-# Essas variáveis podem ser sobrescritas na execução do contêiner
-ENV DD_ENV="production" \
-    DD_SERVICE="selenium-script" \
-    DD_VERSION="1.0.0" \
-    DD_PROFILING_ENABLED="true" \
-    DD_AGENT_HOST="localhost" \
-    DD_TRACE_AGENT_PORT="8126" \
-    CHROMEDRIVER_PATH="/usr/local/bin/chromedriver" \
-    CHROME_BINARY_PATH="/usr/bin/google-chrome"
-
-# Copiar dependências Python
+# Instalar pacotes necessários via pip
 COPY requirements.txt /app/requirements.txt
-WORKDIR /app
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copiar o script Python
+# Definir variáveis de ambiente necessárias para o Datadog
+ENV DD_ENV="production" \
+    DD_SERVICE="ecs-task-gui" \
+    DD_VERSION="1.0.0" \
+    DD_AGENT_HOST="localhost" \
+    DD_TRACE_AGENT_PORT="8126"
+
+# Copiar o script para dentro do container
 COPY script.py /app/script.py
+WORKDIR /app
 
-# Expor a porta 8126 para o Datadog Agent (caso o contêiner seja o próprio agente)
-EXPOSE 8126
-
-# Comando padrão (executar com ddtrace-run)
-CMD ["ddtrace-run", "python", "script.py"]
+# Comando padrão
+CMD ["python", "script.py"]
