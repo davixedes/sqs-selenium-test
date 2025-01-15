@@ -1,4 +1,4 @@
-boto3==1.28.57             # Cliente AWS (SQS, etc.)
-selenium==4.12.0           # Selenium para automação de navegador
-psutil==5.9.5              # Coleta de métricas de recursos (CPU, memória)
-ddtrace[profiling]==1.14.0 # Biblioteca Datadog APM com suporte a Continuous Profiler
+boto3==1.28.57
+selenium==4.12.0
+psutil==5.9.5
+ddtrace==1.14.0
