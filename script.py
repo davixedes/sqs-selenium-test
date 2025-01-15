@@ -23,15 +23,34 @@ profiler = Profiler()
 profiler.start()
 
 # Configurar logger com formato personalizado
+class DatadogLoggerAdapter(logging.LoggerAdapter):
+    """
+    Adapter para adicionar os campos do Datadog (trace_id e span_id) nos logs.
+    """
+    def process(self, msg, kwargs):
+        # Adicionar IDs de trace e span do Datadog nos logs
+        trace_id = tracer.current_trace_id() or "0"
+        span_id = tracer.current_span_id() or "0"
+
+        # Adicionar os campos de serviço, ambiente e versão nos logs
+        extra = self.extra.copy()
+        extra.update({
+            'dd.trace_id': trace_id,
+            'dd.span_id': span_id,
+        })
+        kwargs["extra"] = extra
+        return msg, kwargs
+
+# Configurar formato do logger
 FORMAT = ('%(asctime)s %(levelname)s [%(name)s] [%(filename)s:%(lineno)d] '
           '[dd.service=%(dd.service)s dd.env=%(dd.env)s dd.version=%(dd.version)s dd.trace_id=%(dd.trace_id)s dd.span_id=%(dd.span_id)s] '
           '- %(message)s')
-logging.basicConfig(format=FORMAT)
-log = logging.getLogger("ecs-task-gui")
-log.setLevel(logging.INFO)
 
-# Adicionar variáveis de ambiente globais ao contexto do logger
-logging.LoggerAdapter(log, extra={
+logging.basicConfig(format=FORMAT, level=logging.INFO)
+base_logger = logging.getLogger("ecs-task-gui")
+
+# Adicionar contexto ao logger
+log = DatadogLoggerAdapter(base_logger, {
     'dd.service': os.getenv('DD_SERVICE', 'ecs-task-gui'),
     'dd.env': os.getenv('DD_ENV', 'production'),
     'dd.version': os.getenv('DD_VERSION', '1.0.0'),
@@ -49,9 +68,9 @@ DLQ_URL = os.getenv('DLQ_URL')  # Dead Letter Queue para mensagens com falha
 AWS_REGION = os.getenv('AWS_REGION', 'sa-east-1')
 
 # Configurações do SQS
-MAX_NUMBER_OF_MESSAGES = int(os.getenv('MAX_NUMBER_OF_MESSAGES', 1))  # Processar uma mensagem por vez
+MAX_NUMBER_OF_MESSAGES = int(os.getenv('MAX_NUMBER_OF_MESSAGES', 1))
 POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', 5))
-VISIBILITY_TIMEOUT = int(os.getenv('VISIBILITY_TIMEOUT', 30))  # Tempo de visibilidade da mensagem
+VISIBILITY_TIMEOUT = int(os.getenv('VISIBILITY_TIMEOUT', 30))
 
 sqs_client = boto3.client('sqs', region_name=AWS_REGION)
 
@@ -99,7 +118,7 @@ def get_resource_usage():
 @tracer.wrap("process_message")
 def process_message(message):
     """
-    Processa uma mensagem específica da fila SQS:
+    Processa uma mensagem específica da fila SQS.
     """
     body = message.get('Body', '')
     receipt_handle = message['ReceiptHandle']
@@ -117,7 +136,7 @@ def process_message(message):
             log.info(f"Navegando no site {WEBSITE_URL}")
 
         with tracer.trace("selenium.simulate_navigation"):
-            time.sleep(20)  # Simular navegação
+            time.sleep(20)
 
         memory_usage, cpu_usage = get_resource_usage()
         log.info(
@@ -125,7 +144,6 @@ def process_message(message):
             extra={"cpu_usage": cpu_usage, "memory_usage": memory_usage, "request_id": request_id}
         )
 
-        # Remover mensagem da fila após processamento bem-sucedido
         sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
 
     except Exception as e:
