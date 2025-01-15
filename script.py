@@ -3,6 +3,7 @@ import time
 import uuid
 import psutil
 import boto3
+import logging
 from datetime import datetime
 from threading import Thread
 
@@ -10,29 +11,42 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 
-# Datadog
 from ddtrace import tracer, patch
 from ddtrace.profiling import Profiler
 
 # ---------------
-# Inicialização do Datadog
+# Configuração do Datadog (Logs e APM)
 # ---------------
-# Ativar auto-patching de bibliotecas compatíveis
-patch(threading=True)  # Remove o argumento boto3=True (boto3 já é instrumentado automaticamente)
+patch(logging=True, boto3=True, threading=True)
 
-# Configurar o tracer para enviar spans ao Datadog Agent
+# Configurar tracer
 tracer.configure(
-    hostname=os.getenv('DD_AGENT_HOST', 'localhost'),  # Agente no localhost
-    port=int(os.getenv('DD_TRACE_AGENT_PORT', 8126)),  # Porta padrão do APM
-    debug=True  # Habilitar modo debug para logs detalhados
+    hostname=os.getenv('DD_AGENT_HOST', 'localhost'),
+    port=int(os.getenv('DD_TRACE_AGENT_PORT', 8126))
 )
 
-# Iniciar o Continuous Profiler
+# Iniciar profiler
 profiler = Profiler()
 profiler.start()
 
+# Configurar logger com formato personalizado
+FORMAT = ('%(asctime)s %(levelname)s [%(name)s] [%(filename)s:%(lineno)d] '
+          '[dd.service=%(dd.service)s dd.env=%(dd.env)s dd.version=%(dd.version)s dd.trace_id=%(dd.trace_id)s dd.span_id=%(dd.span_id)s] '
+          '- %(message)s')
+logging.basicConfig(format=FORMAT)
+log = logging.getLogger("ecs-task-gui")
+log.setLevel(logging.INFO)
+
+# Adicionar variáveis de ambiente globais ao contexto do logger
+logging.LoggerAdapter(log, extra={
+    'dd.service': os.getenv('DD_SERVICE', 'ecs-task-gui'),
+    'dd.env': os.getenv('DD_ENV', 'production'),
+    'dd.version': os.getenv('DD_VERSION', '1.0.0'),
+})
+
+
 # ---------------
-# Variáveis de ambiente
+# Variáveis de Ambiente
 # ---------------
 CHROMEDRIVER_PATH = os.getenv('CHROMEDRIVER_PATH', '/usr/local/bin/chromedriver')
 CHROME_BINARY_PATH = os.getenv('CHROME_BINARY_PATH', '/usr/bin/google-chrome')
@@ -41,17 +55,19 @@ WEBSITE_URL = os.getenv(
     'https://satsp.fazenda.sp.gov.br/COMSAT/Public/ConsultaPublica/ConsultaPublicaCfe.aspx'
 )
 SQS_QUEUE_URL = os.getenv('SQS_QUEUE_URL')
+DLQ_URL = os.getenv('DLQ_URL')  # Dead Letter Queue para mensagens com falha
 AWS_REGION = os.getenv('AWS_REGION', 'sa-east-1')
 
 MAX_NUMBER_OF_MESSAGES = int(os.getenv('MAX_NUMBER_OF_MESSAGES', 5))
 POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', 5))
 
-# Cliente SQS
 sqs_client = boto3.client('sqs', region_name=AWS_REGION)
 
+
 # ---------------
-# Funções auxiliares
+# Funções Auxiliares
 # ---------------
+@tracer.wrap("setup_driver")
 def setup_driver():
     """
     Configura o ChromeDriver com as opções adequadas.
@@ -72,15 +88,13 @@ def setup_driver():
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_argument("--remote-debugging-port=9222")
 
-    # Se o DISPLAY estiver setado, adiciona o display
-    if os.getenv('DISPLAY'):
-        chrome_options.add_argument(f"--display={os.getenv('DISPLAY')}")
-
     service = Service(CHROMEDRIVER_PATH)
     driver = webdriver.Chrome(service=service, options=chrome_options)
+    log.info("Driver configurado com sucesso.")
     return driver
 
 
+@tracer.wrap("get_resource_usage")
 def get_resource_usage():
     """
     Retorna o uso de memória (MB) e CPU (%) do processo atual.
@@ -88,81 +102,56 @@ def get_resource_usage():
     process = psutil.Process(os.getpid())
     memory_usage = process.memory_info().rss / 1024 / 1024  # em MB
     cpu_usage = process.cpu_percent(interval=0.1)           # em %
+    log.info(f"Uso de recursos coletado: Mem={memory_usage}MB, CPU={cpu_usage}%")
     return memory_usage, cpu_usage
 
 
-@tracer.wrap(service="ecs-task-gui", resource="process_message")
+@tracer.wrap("process_message")
 def process_message(message, thread_id):
     """
     Processa uma mensagem específica da fila SQS:
-    - Abre o site no Chrome
-    - Coleta métricas (CPU, Memória)
-    - Loga o resultado
-    - Remove a mensagem da fila em caso de sucesso
     """
     body = message.get('Body', '')
-    receipt_handle = message['ReceiptHandle']  # Para deletar a mensagem após sucesso
+    receipt_handle = message['ReceiptHandle']
 
-    # Gera um span para a operação de processamento da mensagem
-    with tracer.trace("sqs.message_processing", resource="selenium_action") as span:
-        span.set_tag("message.body", body)
-        span.set_tag("thread.id", thread_id)
+    if not body or len(body.strip()) == 0:
+        log.warning(f"[Thread {thread_id}] Mensagem vazia ou inválida. Ignorando.")
+        return
 
-        driver = setup_driver()
-        request_id = str(uuid.uuid4())
-        start_time = time.time()
+    driver = setup_driver()
+    request_id = str(uuid.uuid4())
 
-        try:
+    try:
+        with tracer.trace("selenium.load_page", resource=WEBSITE_URL):
             driver.get(WEBSITE_URL)
-            time.sleep(20)  # Simulando tempo de navegação
+            log.info(f"[Thread {thread_id}] Navegando no site {WEBSITE_URL}")
 
-            memory_usage, cpu_usage = get_resource_usage()
-            end_time = time.time()
-            duration = round(end_time - start_time, 2)
+        with tracer.trace("selenium.simulate_navigation"):
+            time.sleep(20)
 
-            # Registrar métricas e informações no span
-            span.set_metric("cpu.usage", cpu_usage)
-            span.set_metric("memory.usage", memory_usage)
-            span.set_tag("request.id", request_id)
-            span.set_metric("processing.duration", duration)
+        memory_usage, cpu_usage = get_resource_usage()
+        log.info(
+            f"[Thread {thread_id}] Mensagem processada com sucesso.",
+            extra={"cpu_usage": cpu_usage, "memory_usage": memory_usage, "request_id": request_id}
+        )
 
-            log_msg = (
-                f"[Thread {thread_id}] "
-                f"RequestID={request_id} "
-                f"Body={body} "
-                f"Status=Sucesso "
-                f"CPU={round(cpu_usage, 2)}% "
-                f"Mem={round(memory_usage, 2)}MB "
-                f"Inicio={datetime.fromtimestamp(start_time).isoformat()} "
-                f"Fim={datetime.fromtimestamp(end_time).isoformat()} "
-                f"Duracao={duration}s"
-            )
-            print(log_msg)
+        sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
 
-            # Remove a mensagem da fila
-            sqs_client.delete_message(
-                QueueUrl=SQS_QUEUE_URL,
-                ReceiptHandle=receipt_handle
-            )
+    except Exception as e:
+        log.error(f"[Thread {thread_id}] Falha ao processar mensagem: {e}", exc_info=True)
 
-        except Exception as e:
-            span.set_tag("error", True)
-            span.set_tag("error.message", str(e))
-            print(f"[Thread {thread_id}] Erro ao processar a mensagem ({body}): {e}")
+        if DLQ_URL:
+            sqs_client.send_message(QueueUrl=DLQ_URL, MessageBody=body)
 
-        finally:
-            driver.quit()
+    finally:
+        driver.quit()
 
 
-@tracer.wrap(service="ecs-task-gui", resource="poll_sqs")
+@tracer.wrap("poll_sqs")
 def poll_sqs():
     """
     Loop infinito que consulta a fila SQS e dispara threads para cada mensagem recebida.
     """
-    if not SQS_QUEUE_URL:
-        print("ERRO: SQS_QUEUE_URL não foi definida. Encerrando.")
-        return
-
     while True:
         try:
             response = sqs_client.receive_message(
@@ -171,32 +160,25 @@ def poll_sqs():
                 WaitTimeSeconds=2,
                 VisibilityTimeout=30
             )
-            messages = response.get('Messages', [])
+            messages = response.get("Messages", [])
 
             if not messages:
-                # Se não há mensagens, aguarda alguns segundos
+                log.info("Nenhuma mensagem encontrada. Aguardando...")
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            threads = []
             for i, msg in enumerate(messages):
-                t = Thread(target=process_message, args=(msg, i))
-                threads.append(t)
-                t.start()
-
-            # Aguarda todas as threads finalizarem
-            for t in threads:
-                t.join()
+                process_message(msg,i)
 
         except Exception as e:
-            print(f"Erro no loop principal de polling SQS: {e}")
-            time.sleep(POLL_INTERVAL_SECONDS)
+            log.error("Erro no loop principal de polling SQS.", exc_info=True)
 
 
 def main():
-    print("Iniciando script de polling do SQS (Datadog APM ativado)...")
+    log.info("Iniciando script de polling do SQS com Datadog APM...")
     poll_sqs()
 
 
 if __name__ == '__main__':
     main()
+

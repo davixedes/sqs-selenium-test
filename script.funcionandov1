@@ -1,0 +1,184 @@
+import os
+import time
+import uuid
+import psutil
+import boto3
+import json
+import logging
+from datetime import datetime
+from threading import Thread
+from ddtrace import tracer, patch, config
+from ddtrace.contrib.logging import patch as logging_patch
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+
+# Ativar auto-patching para bibliotecas
+patch()
+logging_patch()
+
+# Configuração de serviço, ambiente e versão no Datadog
+config.service = os.getenv("DD_SERVICE", "ecs-task-gui")
+config.env = os.getenv("DD_ENV", "production")
+config.version = os.getenv("DD_VERSION", "1.0.0")
+
+# Configurar logger no formato JSON
+class DatadogJSONFormatter(logging.Formatter):
+    def format(self, record):
+        context = tracer.current_trace_context()
+        trace_id = context.trace_id if context else 0
+        span_id = context.span_id if context else 0
+
+        log_record = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "filename": record.filename,
+            "line": record.lineno,
+            "message": record.getMessage(),
+            "dd.service": config.service,
+            "dd.env": config.env,
+            "dd.version": config.version,
+            "dd.trace_id": trace_id,
+            "dd.span_id": span_id,
+        }
+        return json.dumps(log_record)
+
+handler = logging.StreamHandler()
+handler.setFormatter(DatadogJSONFormatter())
+
+logger = logging.getLogger("ecs-task-gui")
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# Variáveis de ambiente
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
+CHROME_BINARY_PATH = os.getenv("CHROME_BINARY_PATH", "/usr/bin/google-chrome")
+WEBSITE_URL = os.getenv(
+    "WEBSITE_URL",
+    "https://satsp.fazenda.sp.gov.br/COMSAT/Public/ConsultaPublica/ConsultaPublicaCfe.aspx",
+)
+SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
+AWS_REGION = os.getenv("AWS_REGION", "sa-east-1")
+MAX_NUMBER_OF_MESSAGES = int(os.getenv("MAX_NUMBER_OF_MESSAGES", 5))
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 5))
+
+# Cliente SQS
+sqs_client = boto3.client("sqs", region_name=AWS_REGION)
+
+# Configuração do Selenium
+def setup_driver():
+    chrome_options = Options()
+    chrome_options.binary_location = CHROME_BINARY_PATH
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=500,500")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--user-data-dir=/tmp")
+    chrome_options.add_argument("--disk-cache-dir=/tmp")
+    chrome_options.add_argument("--enable-logging")
+    chrome_options.add_argument("--log-level=0")
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+
+    if os.getenv("DISPLAY"):
+        chrome_options.add_argument(f"--display={os.getenv('DISPLAY')}")
+
+    service = Service(CHROMEDRIVER_PATH)
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
+
+# Coleta de uso de recursos
+@tracer.wrap(name="resource_usage", resource="system.resource")
+def get_resource_usage():
+    process = psutil.Process(os.getpid())
+    memory_usage = process.memory_info().rss / 1024 / 1024  # em MB
+    cpu_usage = process.cpu_percent(interval=0.1)  # em %
+    return memory_usage, cpu_usage
+
+# Processar mensagem da fila
+@tracer.wrap(name="process_message", resource="sqs.message")
+def process_message(message, thread_id):
+    body = message.get("Body", "")
+    receipt_handle = message["ReceiptHandle"]
+
+    driver = setup_driver()
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+
+    try:
+        logger.info("Iniciando processamento da mensagem.", extra={"request_id": request_id, "body": body})
+
+        with tracer.trace("selenium.navigate", resource="driver.get"):
+            driver.get(WEBSITE_URL)
+            logger.info("Navegando no site.", extra={"url": WEBSITE_URL})
+
+        with tracer.trace("selenium.simulate", resource="simulate.delay"):
+            time.sleep(20)
+            logger.info("Simulação de navegação finalizada.", extra={"duration": "20s"})
+
+        with tracer.trace("resource.monitor", resource="usage.metrics"):
+            memory_usage, cpu_usage = get_resource_usage()
+            duration = round(time.time() - start_time, 2)
+
+        logger.info("Mensagem processada com sucesso.", extra={
+            "request_id": request_id,
+            "cpu_usage": f"{cpu_usage:.2f}%",
+            "memory_usage": f"{memory_usage:.2f}MB",
+            "duration": f"{duration}s"
+        })
+
+        sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
+
+    except Exception as e:
+        logger.error("Erro ao processar mensagem.", extra={"request_id": request_id, "error": str(e)})
+
+    finally:
+        driver.quit()
+
+# Polling na fila SQS
+@tracer.wrap(name="poll_sqs", resource="sqs.poll")
+def poll_sqs():
+    if not SQS_QUEUE_URL:
+        logger.error("SQS_QUEUE_URL não foi definida. Encerrando.")
+        return
+
+    while True:
+        try:
+            response = sqs_client.receive_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MaxNumberOfMessages=MAX_NUMBER_OF_MESSAGES,
+                WaitTimeSeconds=2,
+                VisibilityTimeout=30,
+            )
+            messages = response.get("Messages", [])
+
+            if not messages:
+                logger.info("Nenhuma mensagem encontrada. Aguardando...")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            threads = []
+            for i, msg in enumerate(messages):
+                t = Thread(target=process_message, args=(msg, i))
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join()
+
+        except Exception as e:
+            logger.error("Erro no loop principal de polling SQS.", extra={"error": str(e)})
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+# Função principal
+@tracer.wrap(name="main", resource="polling")
+def main():
+    logger.info("Iniciando polling do SQS...")
+    poll_sqs()
+
+if __name__ == "__main__":
+    main()
