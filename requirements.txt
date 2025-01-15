@@ -1,4 +1,4 @@
-boto3==1.28.57
-selenium==4.12.0
-psutil==5.9.5
-ddtrace==1.14.0
+boto3==1.28.25
+ddtrace==1.15.0
+selenium==4.10.0
+psutil==5.9.0
