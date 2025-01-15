@@ -14,8 +14,8 @@ from ddtrace import tracer, patch, config
 # -----------------
 # Configuração do Datadog e Logging
 # -----------------
-# Habilitar integrações automáticas do Datadog
-patch(logging=True, boto3=True)
+# Habilitar integração automática do logger
+patch(logging=True)
 
 # Configuração do logger com saída JSON
 class JSONFormatter(logging.Formatter):
