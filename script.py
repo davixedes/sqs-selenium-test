@@ -4,163 +4,155 @@ import uuid
 import psutil
 import boto3
 import logging
+import json
 from datetime import datetime
-from ddtrace import tracer
-from ddtrace.profiling import Profiler
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from ddtrace import tracer, patch, config
 
-# --------------- Configuração do Datadog (Logs e APM) ---------------
-# Configurar tracer
-tracer.configure(
-    hostname=os.getenv('DD_AGENT_HOST', 'localhost'),
-    port=int(os.getenv('DD_TRACE_AGENT_PORT', 8126))
-)
+# -----------------
+# Configuração do Datadog e Logging
+# -----------------
+# Habilitar integrações automáticas do Datadog
+patch(logging=True, boto3=True)
 
-# Iniciar profiler
-profiler = Profiler()
-profiler.start()
+# Configuração do logger com saída JSON
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        current_span = tracer.current_span()  # Obter o span atual
+        log_record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "filename": record.filename,
+            "lineno": record.lineno,
+            "dd.service": config.service,
+            "dd.env": config.env,
+            "dd.version": config.version,
+            "dd.trace_id": current_span.trace_id if current_span else None,
+            "dd.span_id": current_span.span_id if current_span else None,
+        }
+        return json.dumps(log_record)
 
-# Configurar logger com formato personalizado
-class DatadogLoggerAdapter(logging.LoggerAdapter):
-    """
-    Adapter para adicionar os campos do Datadog (trace_id e span_id) nos logs.
-    """
-    def process(self, msg, kwargs):
-        # Adicionar IDs de trace e span do Datadog nos logs
-        trace_id = tracer.current_trace_id() or "0"
-        span_id = tracer.current_span_id() or "0"
+# Configurar logger
+json_formatter = JSONFormatter()
+handler = logging.StreamHandler()
+handler.setFormatter(json_formatter)
+log = logging.getLogger(__name__)
+log.addHandler(handler)
+log.setLevel(logging.INFO)
 
-        # Adicionar os campos de serviço, ambiente e versão nos logs
-        extra = self.extra.copy()
-        extra.update({
-            'dd.trace_id': trace_id,
-            'dd.span_id': span_id,
-        })
-        kwargs["extra"] = extra
-        return msg, kwargs
+# Configuração do tracer
+config.env = os.getenv("DD_ENV", "production")
+config.service = os.getenv("DD_SERVICE", "ecs-task-gui")
+config.version = os.getenv("DD_VERSION", "1.0.0")
 
-# Configurar formato do logger
-FORMAT = ('%(asctime)s %(levelname)s [%(name)s] [%(filename)s:%(lineno)d] '
-          '[dd.service=%(dd.service)s dd.env=%(dd.env)s dd.version=%(dd.version)s dd.trace_id=%(dd.trace_id)s dd.span_id=%(dd.span_id)s] '
-          '- %(message)s')
-
-logging.basicConfig(format=FORMAT, level=logging.INFO)
-base_logger = logging.getLogger("ecs-task-gui")
-
-# Adicionar contexto ao logger
-log = DatadogLoggerAdapter(base_logger, {
-    'dd.service': os.getenv('DD_SERVICE', 'ecs-task-gui'),
-    'dd.env': os.getenv('DD_ENV', 'production'),
-    'dd.version': os.getenv('DD_VERSION', '1.0.0'),
-})
-
-# --------------- Variáveis de Ambiente ---------------
+# -----------------
+# Variáveis de Ambiente
+# -----------------
 CHROMEDRIVER_PATH = os.getenv('CHROMEDRIVER_PATH', '/usr/local/bin/chromedriver')
 CHROME_BINARY_PATH = os.getenv('CHROME_BINARY_PATH', '/usr/bin/google-chrome')
-WEBSITE_URL = os.getenv(
-    'WEBSITE_URL',
-    'https://satsp.fazenda.sp.gov.br/COMSAT/Public/ConsultaPublica/ConsultaPublicaCfe.aspx'
-)
-SQS_QUEUE_URL = os.getenv('SQS_QUEUE_URL')
-DLQ_URL = os.getenv('DLQ_URL')  # Dead Letter Queue para mensagens com falha
+WEBSITE_URL = os.getenv('WEBSITE_URL', 'https://satsp.fazenda.sp.gov.br/COMSAT/Public/ConsultaPublica/ConsultaPublicaCfe.aspx')
+SQS_QUEUE_URL = os.getenv('SQS_QUEUE_URL')  # URL da fila SQS
+DLQ_URL = os.getenv('DLQ_URL')  # URL da Dead Letter Queue (DLQ)
 AWS_REGION = os.getenv('AWS_REGION', 'sa-east-1')
-
-# Configurações do SQS
 MAX_NUMBER_OF_MESSAGES = int(os.getenv('MAX_NUMBER_OF_MESSAGES', 1))
 POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', 5))
 VISIBILITY_TIMEOUT = int(os.getenv('VISIBILITY_TIMEOUT', 30))
 
+# Cliente SQS
 sqs_client = boto3.client('sqs', region_name=AWS_REGION)
 
-# --------------- Funções Auxiliares ---------------
+# -----------------
+# Funções Auxiliares
+# -----------------
 
 @tracer.wrap("setup_driver")
 def setup_driver():
-    """
-    Configura o ChromeDriver com as opções adequadas.
-    """
+    """Configura o ChromeDriver com as opções adequadas."""
     chrome_options = Options()
     chrome_options.binary_location = CHROME_BINARY_PATH
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=500,500")
+    chrome_options.add_argument("--window-size=1200,800")
     chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--user-data-dir=/tmp")
-    chrome_options.add_argument("--disk-cache-dir=/tmp")
-    chrome_options.add_argument("--enable-logging")
-    chrome_options.add_argument("--log-level=0")
-    chrome_options.add_argument("--disable-background-networking")
-    chrome_options.add_argument("--disable-sync")
-    chrome_options.add_argument("--start-maximized")
-    chrome_options.add_argument("--remote-debugging-port=9222")
-
     service = Service(CHROMEDRIVER_PATH)
     driver = webdriver.Chrome(service=service, options=chrome_options)
     log.info("Driver configurado com sucesso.")
     return driver
 
+@tracer.wrap("send_to_dlq")
+def send_to_dlq(message_body):
+    """Envia uma mensagem para a Dead Letter Queue (DLQ)."""
+    if not DLQ_URL:
+        log.error("DLQ_URL não está definida. Mensagem não pode ser enviada para a DLQ.")
+        return
 
-@tracer.wrap("get_resource_usage")
-def get_resource_usage():
-    """
-    Retorna o uso de memória (MB) e CPU (%) do processo atual.
-    """
-    process = psutil.Process(os.getpid())
-    memory_usage = process.memory_info().rss / 1024 / 1024  # em MB
-    cpu_usage = process.cpu_percent(interval=0.1)           # em %
-    log.info(f"Uso de recursos coletado: Mem={memory_usage}MB, CPU={cpu_usage}%")
-    return memory_usage, cpu_usage
-
+    try:
+        sqs_client.send_message(
+            QueueUrl=DLQ_URL,
+            MessageBody=message_body
+        )
+        log.info(json.dumps({"action": "send_to_dlq", "status": "success", "message_body": message_body}))
+    except Exception as e:
+        log.error(json.dumps({"action": "send_to_dlq", "status": "error", "error": str(e)}))
 
 @tracer.wrap("process_message")
 def process_message(message):
-    """
-    Processa uma mensagem específica da fila SQS.
-    """
-    body = message.get('Body', '')
+    """Processa uma mensagem SQS e navega no site usando Selenium."""
+    body = message.get('Body', '{}')
     receipt_handle = message['ReceiptHandle']
+    log.info(json.dumps({"action": "receive_message", "message_body": body}))
 
-    if not body or len(body.strip()) == 0:
-        log.warning("Mensagem vazia ou inválida. Ignorando.")
+    # Parâmetros padrão e extraídos do payload
+    request_id = str(uuid.uuid4())
+    payload = {}
+    site_url = WEBSITE_URL  # URL fixa como fallback
+
+    # Parse do payload
+    try:
+        payload = json.loads(body)  # Converte o Body para dicionário
+        site_url = payload.get('WEBSITE_URL', WEBSITE_URL)
+    except Exception as e:
+        log.error(json.dumps({"action": "parse_payload", "status": "error", "error": str(e)}))
+        send_to_dlq(body)  # Envia a mensagem para a DLQ em caso de erro no parse
         return
 
-    driver = setup_driver()
-    request_id = str(uuid.uuid4())
+    log.info(json.dumps({"action": "parse_payload", "status": "success", "payload": payload}))
 
-    try:
-        with tracer.trace("selenium.load_page", resource=WEBSITE_URL):
-            driver.get(WEBSITE_URL)
-            log.info(f"Navegando no site {WEBSITE_URL}")
+    # Criar o trace para monitorar a navegação
+    with tracer.trace("process_message", service="selenium-task", resource="process_message") as span:
+        span.set_tag("request_id", request_id)
+        span.set_tag("payload", payload)
 
-        with tracer.trace("selenium.simulate_navigation"):
-            time.sleep(20)
+        # Configura o driver e navega para o site
+        driver = setup_driver()
+        try:
+            log.info(json.dumps({"action": "navigate_to_site", "url": site_url}))
+            driver.get(site_url)  # Navegar para o site
+            time.sleep(10)  # Simula navegação no site
+            log.info(json.dumps({"action": "navigate_to_site", "status": "success", "url": site_url}))
+        except Exception as e:
+            log.error(json.dumps({"action": "navigate_to_site", "status": "error", "error": str(e)}))
+            span.set_tag("error", str(e))
+            send_to_dlq(body)  # Envia a mensagem para a DLQ em caso de falha de navegação
+        finally:
+            driver.quit()
 
-        memory_usage, cpu_usage = get_resource_usage()
-        log.info(
-            "Mensagem processada com sucesso.",
-            extra={"cpu_usage": cpu_usage, "memory_usage": memory_usage, "request_id": request_id}
-        )
-
-        sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
-
-    except Exception as e:
-        log.error(f"Falha ao processar mensagem: {e}", exc_info=True)
-
-        if DLQ_URL:
-            sqs_client.send_message(QueueUrl=DLQ_URL, MessageBody=body)
-
-    finally:
-        driver.quit()
-
+        # Marcar mensagem como processada (delete da fila)
+        try:
+            sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
+            log.info(json.dumps({"action": "delete_message", "status": "success"}))
+        except Exception as e:
+            log.error(json.dumps({"action": "delete_message", "status": "error", "error": str(e)}))
+            send_to_dlq(body)  # Envia a mensagem para a DLQ se não puder ser removida da fila
 
 @tracer.wrap("poll_sqs")
 def poll_sqs():
-    """
-    Loop infinito que consulta a fila SQS e processa mensagens.
-    """
+    """Loop para consultar mensagens na fila SQS."""
     while True:
         try:
             response = sqs_client.receive_message(
@@ -169,10 +161,9 @@ def poll_sqs():
                 WaitTimeSeconds=10,
                 VisibilityTimeout=VISIBILITY_TIMEOUT
             )
-            messages = response.get("Messages", [])
-
+            messages = response.get('Messages', [])
             if not messages:
-                log.info("Nenhuma mensagem encontrada. Aguardando...")
+                log.info(json.dumps({"action": "poll_sqs", "status": "no_messages"}))
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
@@ -180,14 +171,15 @@ def poll_sqs():
                 process_message(message)
 
         except Exception as e:
-            log.error("Erro no loop principal de polling SQS.", exc_info=True)
+            log.error(json.dumps({"action": "poll_sqs", "status": "error", "error": str(e)}))
+            time.sleep(POLL_INTERVAL_SECONDS)
 
-
-# --------------- Função Principal ---------------
+# -----------------
+# Função Principal
+# -----------------
 def main():
-    log.info("Iniciando script de polling do SQS com Datadog APM...")
+    log.info(json.dumps({"action": "start_script", "status": "running"}))
     poll_sqs()
-
 
 if __name__ == '__main__':
     main()
