@@ -42,20 +42,20 @@ RUN CHROME_VERSION=$(google-chrome --version | awk '{print $3}') && \
 # Limpeza para reduzir o tamanho da imagem
 RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Instalar pacotes necessários via pip
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# Instalar o Datadog Trace Profiler para Python
+RUN pip install --no-cache-dir ddtrace boto3
 
-# Definir variáveis de ambiente necessárias para o Datadog
+# Configurar Datadog
 ENV DD_ENV="production" \
-    DD_SERVICE="ecs-task-gui" \
+    DD_SERVICE="selenium-script" \
     DD_VERSION="1.0.0" \
+    DD_PROFILING_ENABLED="true" \
     DD_AGENT_HOST="localhost" \
     DD_TRACE_AGENT_PORT="8126"
 
-# Copiar o script para dentro do container
-COPY script.py /app/script.py
+# Copiar o script Python
 WORKDIR /app
+COPY script.py /app/script.py
 
 # Comando padrão
 CMD ["python", "script.py"]
