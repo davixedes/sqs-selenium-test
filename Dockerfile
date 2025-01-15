@@ -1,7 +1,6 @@
-# Base image do Python
 FROM python:3.9-slim
 
-# Instalar dependências do sistema necessárias para o Selenium
+# Instalar dependências de sistema
 RUN apt-get update && apt-get install -y \
     wget \
     unzip \
@@ -24,13 +23,13 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Adicionar e instalar dependências do Python
+# Instalar dependências Python
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar o código da aplicação para o container
+# Copiar o código
 COPY . /app
 
-# Definir o comando de execução
+# Executar o script
 CMD ["python", "script.py"]
