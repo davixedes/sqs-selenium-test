@@ -67,5 +67,5 @@ COPY script.py /app/script.py
 # Expor a porta 8126 para o Datadog Agent (caso o contêiner seja o próprio agente)
 EXPOSE 8126
 
-# Comando padrão
-CMD ["python", "script.py"]
+# Comando padrão (executar com ddtrace-run)
+CMD ["ddtrace-run", "python", "script.py"]
