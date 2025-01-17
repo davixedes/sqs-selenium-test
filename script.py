@@ -5,123 +5,160 @@ import boto3
 import logging
 import json
 from datetime import datetime
+from ddtrace import tracer, patch
+from ddtrace.profiling import Profiler
+
+# Aplicar patch apenas para logs
+patch(logging=True)
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from ddtrace import tracer, patch, config
 
-# -----------------
-# Configuração do Datadog e Logging
-# -----------------
-patch(logging=True)
+# Configurar tracer
+tracer.configure(
+    hostname=os.getenv('DD_AGENT_HOST', 'localhost'),
+    port=int(os.getenv('DD_TRACE_AGENT_PORT', 8126))
+)
 
+# Iniciar profiler
+profiler = Profiler()
+profiler.start()
+
+# Configurar logger estruturado em JSON para correlação com Datadog APM
 class JSONFormatter(logging.Formatter):
+    """Formato de log estruturado em JSON para correlação com Datadog APM."""
     def format(self, record):
-        current_span = tracer.current_span()
+        span = tracer.current_span()  # Obter o span atual, se existir
         log_record = {
             "timestamp": datetime.utcnow().isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
-            "filename": record.filename,
-            "lineno": record.lineno,
-            "dd.service": config.service,
-            "dd.env": config.env,
-            "dd.version": config.version,
-            "dd.trace_id": current_span.trace_id if current_span else None,
-            "dd.span_id": current_span.span_id if current_span else None,
+            "dd.trace_id": span.trace_id if span else None,  # Evitar erro caso não haja span
+            "dd.span_id": span.span_id if span else None,  # Evitar erro caso não haja span
         }
         return json.dumps(log_record)
 
-json_formatter = JSONFormatter()
-handler = logging.StreamHandler()
-handler.setFormatter(json_formatter)
-log = logging.getLogger(__name__)
-log.addHandler(handler)
+log = logging.getLogger("ecs-task-gui")
 log.setLevel(logging.INFO)
 
-config.env = os.getenv("DD_ENV", "production")
-config.service = os.getenv("DD_SERVICE", "ecs-task-gui")
-config.version = os.getenv("DD_VERSION", "1.0.0")
+# Configurar handler para stdout
+stdout_handler = logging.StreamHandler()
+stdout_handler.setFormatter(JSONFormatter())  # Aplicar formatação JSON
+log.addHandler(stdout_handler)
 
-# -----------------
 # Variáveis de Ambiente
-# -----------------
 CHROMEDRIVER_PATH = os.getenv('CHROMEDRIVER_PATH', '/usr/local/bin/chromedriver')
 CHROME_BINARY_PATH = os.getenv('CHROME_BINARY_PATH', '/usr/bin/google-chrome')
-WEBSITE_URL = os.getenv('WEBSITE_URL', 'https://example.com')
+WEBSITE_URL = os.getenv(
+    'WEBSITE_URL',
+    'https://satsp.fazenda.sp.gov.br/COMSAT/Public/ConsultaPublica/ConsultaPublicaCfe.aspx'
+)
 SQS_QUEUE_URL = os.getenv('SQS_QUEUE_URL')
-DLQ_URL = os.getenv('DLQ_URL')
+DLQ_URL = os.getenv('DLQ_URL')  
 AWS_REGION = os.getenv('AWS_REGION', 'sa-east-1')
+
+# Configurações do SQS
+MAX_NUMBER_OF_MESSAGES = 1  
 POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL_SECONDS', 5))
+VISIBILITY_TIMEOUT = int(os.getenv('VISIBILITY_TIMEOUT', 30))
 
 sqs_client = boto3.client('sqs', region_name=AWS_REGION)
 
+@tracer.wrap("setup_driver")
 def setup_driver():
     chrome_options = Options()
     chrome_options.binary_location = CHROME_BINARY_PATH
-    chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=500,500")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--user-data-dir=/tmp")
+    chrome_options.add_argument("--disk-cache-dir=/tmp")
+    chrome_options.add_argument("--enable-logging")
+    chrome_options.add_argument("--log-level=0")
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+
     service = Service(CHROMEDRIVER_PATH)
-    return webdriver.Chrome(service=service, options=chrome_options)
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    log.info("Driver configurado com sucesso.")
+    return driver
 
-def send_to_dlq(message_body):
-    if not DLQ_URL:
-        log.error("DLQ_URL não está definida.")
-        return
-    try:
-        sqs_client.send_message(QueueUrl=DLQ_URL, MessageBody=message_body)
-        log.info({"action": "send_to_dlq", "status": "success", "message_body": message_body})
-    except Exception as e:
-        log.error({"action": "send_to_dlq", "status": "error", "error": str(e)})
-
+@tracer.wrap("process_message")
 def process_message(message):
-    body = message.get('Body', '{}')
+    body = message.get('Body', '')
     receipt_handle = message['ReceiptHandle']
 
-    try:
-        payload = json.loads(body)
-        site_url = payload.get('WEBSITE_URL', WEBSITE_URL)
-    except json.JSONDecodeError as e:
-        log.error({"action": "parse_payload", "status": "error", "error": str(e)})
-        send_to_dlq(body)
+    if not body or len(body.strip()) == 0:
+        log.warning("Mensagem vazia ou inválida. Ignorando.")
         return
 
-    with tracer.trace("process_message", service="selenium-task", resource="navigate_to_site") as span:
-        span.set_tag("message_body", body)
-        span.set_tag("site_url", site_url)
-
-        driver = setup_driver()
-        try:
-            driver.get(site_url)
-            time.sleep(5)
-            log.info({"action": "navigate_to_site", "status": "success", "url": site_url})
-        except Exception as e:
-            span.set_tag("error", str(e))
-            send_to_dlq(body)
-        finally:
-            driver.quit()
+    driver = setup_driver()
+    request_id = str(uuid.uuid4())
 
     try:
+        with tracer.trace("selenium.load_page", resource=WEBSITE_URL) as span:
+            start_time = time.time()
+            driver.get(WEBSITE_URL)
+            load_time = time.time() - start_time
+            log.info(f"Navegando no site {WEBSITE_URL}", extra={"load_time_seconds": load_time})
+
+        with tracer.trace("selenium.simulate_navigation") as span:
+            start_time = time.time()
+            time.sleep(20)  
+            nav_time = time.time() - start_time
+            log.info("Simulação de navegação concluída.", extra={"navigation_time_seconds": nav_time})
+
+        log.info("Mensagem processada com sucesso.", extra={"request_id": request_id})
+
+        # Remover mensagem da fila após processamento bem-sucedido
         sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
-        log.info({"action": "delete_message", "status": "success"})
+
     except Exception as e:
-        send_to_dlq(body)
+        log.error(f"Falha ao processar mensagem: {e}")
+
+        if DLQ_URL:
+            sqs_client.send_message(QueueUrl=DLQ_URL, MessageBody=body)
+
+    finally:
+        driver.quit()
 
 def poll_sqs():
+    """
+    Loop que consulta a fila SQS e processa mensagens uma por vez.
+    Agora não há mais um trace para polling, apenas quando há mensagens.
+    """
     while True:
         try:
-            response = sqs_client.receive_message(QueueUrl=SQS_QUEUE_URL, MaxNumberOfMessages=1, WaitTimeSeconds=10)
-            messages = response.get('Messages', [])
-            if messages:
-                for message in messages:
-                    process_message(message)
-            else:
+            response = sqs_client.receive_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MaxNumberOfMessages=MAX_NUMBER_OF_MESSAGES,
+                WaitTimeSeconds=10,
+                VisibilityTimeout=VISIBILITY_TIMEOUT
+            )
+            messages = response.get("Messages", [])
+
+            # Se não houver mensagens, evitar spans desnecessários
+            if not messages:
                 time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            # Criar um novo trace apenas para mensagens recebidas
+            for message in messages:
+                with tracer.trace("sqs.receive_message", service="ecs-task-gui", span_type="queue"):
+                    process_message(message)
+
         except Exception as e:
-            log.error({"action": "poll_sqs", "status": "error", "error": str(e)})
+            log.error("Erro no loop principal de polling SQS.", extra={"exception": str(e)})
+
+def main():
+    log.info("Iniciando script de polling do SQS com Datadog APM...")
+    poll_sqs()
 
 if __name__ == '__main__':
-    poll_sqs()
+    main()
